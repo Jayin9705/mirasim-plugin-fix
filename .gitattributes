@@ -1,0 +1,5 @@
+# 补丁必须保持 LF 行尾，否则 git apply 会失败（Windows 上默认 CRLF 转换）
+*.patch -text
+*.sh -text
+# 记录类文本正常处理
+*.md text

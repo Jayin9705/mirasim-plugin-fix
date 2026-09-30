@@ -1,0 +1,15 @@
+# 排除编译产物（单个 24MB，不入库）
+out/
+*.so
+
+# 任何凭据 / 密钥绝不入库
+*.key
+*.pem
+*credentials*
+auth.json
+*.token
+
+# 临时文件
+_tmp_*
+*.part
+__pycache__/

@@ -1,0 +1,187 @@
+diff --git a/internal/executor/claude_identity.go b/internal/executor/claude_identity.go
+new file mode 100644
+index 0000000..2178175
+--- /dev/null
++++ b/internal/executor/claude_identity.go
+@@ -0,0 +1,59 @@
++package executor
++
++import (
++	"strings"
++
++	"github.com/tidwall/gjson"
++	"github.com/tidwall/sjson"
++)
++
++// claudeCodeIdentity is the system prompt the relay's Claude mount requires.
++// Its Claude models are served on Claude Code subscriptions, so a Messages
++// request whose system does not carry this identity is refused with a bare
++// HTTP 400 ("the request was rejected as invalid") whatever else it holds,
++// while the same request with it is served. Callers that are not Claude Code,
++// such as an OpenAI client translated here, never send it.
++const claudeCodeIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
++
++// ensureClaudeCodeIdentity puts the identity first in system for Claude
++// models, keeping every block the caller sent after it unchanged. A request
++// that already opens with the identity, as Claude Code's own do, is returned
++// as it is.
++func ensureClaudeCodeIdentity(body []byte, model string) []byte {
++	if !strings.HasPrefix(strings.ToLower(normalizeModel(model)), "claude-") {
++		return body
++	}
++	identity, errIdentity := sjson.Set(`{"type":"text"}`, "text", claudeCodeIdentity)
++	if errIdentity != nil {
++		return body
++	}
++	system := gjson.GetBytes(body, "system")
++	blocks := []string{identity}
++	switch {
++	case system.IsArray():
++		existing := system.Array()
++		if len(existing) > 0 && strings.HasPrefix(strings.TrimSpace(existing[0].Get("text").String()), claudeCodeIdentity) {
++			return body
++		}
++		for _, block := range existing {
++			blocks = append(blocks, block.Raw)
++		}
++	case system.Type == gjson.String:
++		text := system.String()
++		if strings.HasPrefix(strings.TrimSpace(text), claudeCodeIdentity) {
++			return body
++		}
++		if strings.TrimSpace(text) != "" {
++			block, errBlock := sjson.Set(`{"type":"text"}`, "text", text)
++			if errBlock != nil {
++				return body
++			}
++			blocks = append(blocks, block)
++		}
++	}
++	updated, errSet := sjson.SetRawBytes(body, "system", []byte("["+strings.Join(blocks, ",")+"]"))
++	if errSet != nil {
++		return body
++	}
++	return updated
++}
+diff --git a/internal/executor/claude_identity_test.go b/internal/executor/claude_identity_test.go
+new file mode 100644
+index 0000000..dda7d73
+--- /dev/null
++++ b/internal/executor/claude_identity_test.go
+@@ -0,0 +1,86 @@
++package executor
++
++import (
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++	thinkingpkg "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/thinking"
++	"github.com/tidwall/gjson"
++)
++
++func TestEnsureClaudeCodeIdentity(t *testing.T) {
++	tests := []struct {
++		name      string
++		model     string
++		body      string
++		wantTexts []string // nil means the body must come back unchanged
++	}{
++		{name: "no system", model: "claude-opus-5-5", body: `{"model":"claude-opus-5-5"}`, wantTexts: []string{claudeCodeIdentity}},
++		{name: "string system follows the identity", model: "claude-opus-5-5", body: `{"system":"be terse"}`, wantTexts: []string{claudeCodeIdentity, "be terse"}},
++		{name: "empty string system", model: "claude-sonnet-5", body: `{"system":""}`, wantTexts: []string{claudeCodeIdentity}},
++		{name: "array system follows the identity", model: "claude-fable-5-1", body: `{"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}`, wantTexts: []string{claudeCodeIdentity, "a", "b"}},
++		{name: "Claude Code array is unchanged", model: "claude-opus-5-5", body: `{"system":[{"type":"text","text":"` + claudeCodeIdentity + `"},{"type":"text","text":"x"}]}`},
++		{name: "Claude Code string is unchanged", model: "claude-opus-5-5", body: `{"system":"` + claudeCodeIdentity + ` more"}`},
++		{name: "prefix and suffix do not hide the family", model: "mirasim/claude-opus-5-5(high)", body: `{}`, wantTexts: []string{claudeCodeIdentity}},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			got := ensureClaudeCodeIdentity([]byte(test.body), test.model)
++			if test.wantTexts == nil {
++				if string(got) != test.body {
++					t.Fatalf("body changed: %s", got)
++				}
++				return
++			}
++			blocks := gjson.GetBytes(got, "system").Array()
++			if len(blocks) != len(test.wantTexts) {
++				t.Fatalf("system = %s", gjson.GetBytes(got, "system").Raw)
++			}
++			for i, want := range test.wantTexts {
++				if blocks[i].Get("type").String() != "text" || blocks[i].Get("text").String() != want {
++					t.Fatalf("block %d = %s", i, blocks[i].Raw)
++				}
++			}
++		})
++	}
++
++	kept := ensureClaudeCodeIdentity([]byte(`{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]}`), "claude-opus-5-5")
++	if got := gjson.GetBytes(kept, "system.1.cache_control.type").String(); got != "ephemeral" {
++		t.Fatalf("caller block was not kept intact: %s", kept)
++	}
++	for _, model := range []string{"deepseek-flash", "kimi-k3", "glm-5.3-flash", "gpt-5.6-sol"} {
++		if got := ensureClaudeCodeIdentity([]byte(`{"system":"x"}`), model); string(got) != `{"system":"x"}` {
++			t.Fatalf("%s body changed: %s", model, got)
++		}
++	}
++}
++
++func TestBuildProviderRequestAddsClaudeCodeIdentityForOpenAIClients(t *testing.T) {
++	payloads := map[sdktranslator.Format]string{
++		sdktranslator.FormatOpenAIResponse: `{"model":"claude-opus-5-5","input":[{"role":"user","content":[{"type":"input_text","text":"Reply with exactly: pong"}]}],"max_output_tokens":256,"stream":false}`,
++		sdktranslator.FormatOpenAI:         `{"model":"claude-opus-5-5","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}`,
++	}
++	for source, payload := range payloads {
++		body, route, errBuild := buildProviderRequest(pluginapi.ExecutorRequest{
++			Model:        "claude-opus-5-5",
++			SourceFormat: source.String(),
++			Payload:      []byte(payload),
++		}, false, thinkingpkg.ShapeUnknown)
++		if errBuild != nil {
++			t.Fatal(errBuild)
++		}
++		if route.Path != "/v1/messages" || gjson.GetBytes(body, "system.0.text").String() != claudeCodeIdentity {
++			t.Fatalf("%s: body = %s", source, body)
++		}
++	}
++
++	body, _, errBuild := buildProviderRequest(pluginapi.ExecutorRequest{
++		Model:        "deepseek-flash",
++		SourceFormat: sdktranslator.FormatOpenAI.String(),
++		Payload:      []byte(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}`),
++	}, false, thinkingpkg.ShapeUnknown)
++	if errBuild != nil || gjson.GetBytes(body, "system").Exists() {
++		t.Fatalf("deepseek gained a system: %s, %v", body, errBuild)
++	}
++}
+diff --git a/internal/executor/executor.go b/internal/executor/executor.go
+index b79cae6..aa167af 100644
+--- a/internal/executor/executor.go
++++ b/internal/executor/executor.go
+@@ -127,6 +127,7 @@ func (e *Executor) CountTokens(ctx context.Context, req pluginapi.ExecutorReques
+ 		return pluginapi.ExecutorResponse{}, errNormalize
+ 	}
+ 	requestBody = thinkingpkg.NormalizeForWire(requestBody, normalizeModel(req.Model), sdktranslator.FormatClaude.String(), claudeShape(client, req.Model))
++	requestBody = ensureClaudeCodeIdentity(requestBody, normalizeModel(req.Model))
+ 	resp, errDo := client.Do(ctx, req.HTTPClient, http.MethodPost, "/v1/messages/count_tokens", req.Query, requestHeaders(req, sdktranslator.FormatClaude), requestBody)
+ 	if errDo != nil {
+ 		return pluginapi.ExecutorResponse{}, errDo
+@@ -183,6 +184,9 @@ func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRe
+ 			}
+ 			model := modelFromJSON(body)
+ 			body, errParse = normalizeHTTPRequestBody(body, model, wireFormat, claudeShape(client, model))
++			if errParse == nil && wireFormat == sdktranslator.FormatClaude {
++				body = ensureClaudeCodeIdentity(body, model)
++			}
+ 		}
+ 		if errParse != nil {
+ 			return pluginapi.ExecutorHTTPResponse{}, errParse
+@@ -285,6 +289,7 @@ func buildProviderRequest(req pluginapi.ExecutorRequest, stream bool, shape thin
+ 	path := "/v1/responses"
+ 	if wire == sdktranslator.FormatClaude {
+ 		path = "/v1/messages"
++		body = ensureClaudeCodeIdentity(body, model)
+ 	}
+ 	return body, providerRoute{Format: wire, Path: path, Query: cloneValues(req.Query)}, nil
+ }

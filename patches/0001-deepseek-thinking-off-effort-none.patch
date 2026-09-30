@@ -1,0 +1,137 @@
+diff --git a/internal/executor/executor_test.go b/internal/executor/executor_test.go
+index c7b8076..bd213a6 100644
+--- a/internal/executor/executor_test.go
++++ b/internal/executor/executor_test.go
+@@ -257,6 +257,26 @@ func TestBuildProviderRequestRepairsClaudeThinkingWithoutASuffix(t *testing.T) {
+ 	}
+ }
+ 
++func TestBuildProviderRequestTurnsDeepSeekThinkingOffWithNoneEffort(t *testing.T) {
++	// The shape a caller reaches for when it disables thinking on a model whose
++	// roster entry is not adaptive: the shape must not decide this mapping, and
++	// the relay serves the off state as effort=none rather than the roster's own
++	// "off" label.
++	for _, shape := range []thinkingpkg.ModelShape{thinkingpkg.ShapeUnknown, thinkingpkg.ShapeBudget} {
++		body, route, errBuild := buildProviderRequest(pluginapi.ExecutorRequest{
++			Model:        "deepseek-flash",
++			SourceFormat: sdktranslator.FormatOpenAI.String(),
++			Payload:      []byte(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hello"}],"max_tokens":1024,"enable_thinking":false,"reasoning_effort":"none"}`),
++		}, false, shape)
++		if errBuild != nil {
++			t.Fatal(errBuild)
++		}
++		if route.Path != "/v1/messages" || gjson.GetBytes(body, "output_config.effort").String() != "none" || gjson.GetBytes(body, "thinking").Exists() {
++			t.Fatalf("shape %d: body = %s, route = %#v", shape, body, route)
++		}
++	}
++}
++
+ func TestBuildProviderRequestAppliesClaudeEffort(t *testing.T) {
+ 	body, _, errBuild := buildProviderRequest(pluginapi.ExecutorRequest{
+ 		Model:        "claude-sonnet-5(low)",
+diff --git a/internal/thinking/applier.go b/internal/thinking/applier.go
+index cfae17a..5f3fd90 100644
+--- a/internal/thinking/applier.go
++++ b/internal/thinking/applier.go
+@@ -19,6 +19,12 @@ const (
+ 	// upstream effort: the client sends max and layers a multi-turn workflow on
+ 	// top of it.
+ 	workflowEffort = "ultra"
++	// deepseekNoThinkingEffort is the effort the relay's Messages mount serves
++	// DeepSeek without thinking under. The signed roster labels that rung "off",
++	// but the relay refuses effort=off with a bare HTTP 400 ("The request was
++	// rejected as invalid."), and thinking.type=disabled is ignored rather than
++	// honored, so none is the only form that actually turns thinking off.
++	deepseekNoThinkingEffort = "none"
+ )
+ 
+ // ModelShape selects the Claude thinking form a model accepts upstream. The
+@@ -245,8 +251,7 @@ func applyClaude(body []byte, model string, config pluginapi.ThinkingConfig, sha
+ 	switch config.Mode {
+ 	case "none":
+ 		if strings.HasPrefix(model, "deepseek-") {
+-			body = deletePath(body, "thinking")
+-			return setString(body, "output_config.effort", "off"), nil
++			return deepseekThinkingOff(body), nil
+ 		}
+ 		if strings.HasPrefix(model, "glm-") || strings.HasPrefix(model, "kimi-") {
+ 			return body, &ConfigError{Code: "mirasim_effort_invalid", Message: fmt.Sprintf("%s does not offer an off effort", model)}
+@@ -262,11 +267,12 @@ func applyClaude(body []byte, model string, config pluginapi.ThinkingConfig, sha
+ 		}
+ 		return applyManualClaude(body, 1024)
+ 	case "level":
++		// Checked before the shape: the roster leaves DeepSeek without an adaptive
++		// flag, so a warm roster selects the budget form, where off has no budget.
++		if (config.Level == "off" || config.Level == deepseekNoThinkingEffort) && strings.HasPrefix(model, "deepseek-") {
++			return deepseekThinkingOff(body), nil
++		}
+ 		if adaptive {
+-			if config.Level == "off" && strings.HasPrefix(model, "deepseek-") {
+-				body = deletePath(body, "thinking")
+-				return setString(body, "output_config.effort", "off"), nil
+-			}
+ 			if !modelAcceptsEffort(model, config.Level) {
+ 				return body, &ConfigError{
+ 					Code:    "mirasim_claude_effort_invalid",
+@@ -295,6 +301,11 @@ func applyClaude(body []byte, model string, config pluginapi.ThinkingConfig, sha
+ 	}
+ }
+ 
++func deepseekThinkingOff(body []byte) []byte {
++	body = deletePath(body, "thinking")
++	return setString(body, "output_config.effort", deepseekNoThinkingEffort)
++}
++
+ func modelAcceptsEffort(model, level string) bool {
+ 	switch {
+ 	case strings.HasPrefix(model, "deepseek-"):
+diff --git a/internal/thinking/applier_test.go b/internal/thinking/applier_test.go
+index f035552..a05e84e 100644
+--- a/internal/thinking/applier_test.go
++++ b/internal/thinking/applier_test.go
+@@ -77,21 +77,40 @@ func TestParseModelUsesCPASuffixConvention(t *testing.T) {
+ 	}
+ }
+ 
+-func TestDeepSeekOffKeepsItsOwnEffort(t *testing.T) {
++func TestDeepSeekOffSendsTheEffortTheRelayServes(t *testing.T) {
+ 	parsed := ParseModel("deepseek-flash(off)")
+ 	if parsed.ModelName != "deepseek-flash" || parsed.Config.Mode != "level" || parsed.Config.Level != "off" {
+ 		t.Fatalf("parsed model = %#v", parsed)
+ 	}
+-	body, err := ApplyForWire([]byte(`{"model":"deepseek-flash","thinking":{"type":"adaptive"}}`), parsed.ModelName, wireClaude, parsed.Config)
+-	if err != nil || gjson.GetBytes(body, "output_config.effort").String() != "off" || gjson.GetBytes(body, "thinking").Exists() {
+-		t.Fatalf("DeepSeek off body = %s, error = %v", body, err)
++	for _, shape := range []ModelShape{ShapeUnknown, ShapeAdaptive, ShapeBudget} {
++		body, err := ApplyForWireWithShape([]byte(`{"model":"deepseek-flash","thinking":{"type":"adaptive"}}`), parsed.ModelName, wireClaude, parsed.Config, shape)
++		if err != nil || gjson.GetBytes(body, "output_config.effort").String() != "none" || gjson.GetBytes(body, "thinking").Exists() {
++			t.Fatalf("shape %d: DeepSeek off body = %s, error = %v", shape, body, err)
++		}
+ 	}
+-	_, err = ApplyForWire([]byte(`{}`), "claude-sonnet-5", wireClaude, parsed.Config)
++	_, err := ApplyForWire([]byte(`{}`), "claude-sonnet-5", wireClaude, parsed.Config)
+ 	if err == nil {
+ 		t.Fatal("Claude unexpectedly accepted the DeepSeek-only off effort")
+ 	}
+ }
+ 
++func TestDeepSeekDisabledThinkingBecomesNoneEffort(t *testing.T) {
++	// CPA's OpenAI translator turns reasoning_effort=none into this form.
++	body := []byte(`{"model":"deepseek-flash","max_tokens":1024,"thinking":{"type":"disabled"},"messages":[]}`)
++	for _, shape := range []ModelShape{ShapeUnknown, ShapeBudget} {
++		got := NormalizeForWire(body, "deepseek-flash", wireClaude, shape)
++		if gjson.GetBytes(got, "output_config.effort").String() != "none" || gjson.GetBytes(got, "thinking").Exists() {
++			t.Fatalf("shape %d: normalized body = %s", shape, got)
++		}
++	}
++	for _, effort := range []string{"off", "none"} {
++		got := NormalizeForWire([]byte(`{"model":"deepseek-flash","output_config":{"effort":"`+effort+`"}}`), "deepseek-flash", wireClaude, ShapeBudget)
++		if gjson.GetBytes(got, "output_config.effort").String() != "none" || gjson.GetBytes(got, "thinking").Exists() {
++			t.Fatalf("effort %s: normalized body = %s", effort, got)
++		}
++	}
++}
++
+ func TestApplyForWireUsesAdaptiveClaudeControls(t *testing.T) {
+ 	body := []byte(`{"model":"claude-sonnet-5","max_tokens":4096,"messages":[],"output_config":{"effort":"low","format":{"type":"json_schema"}}}`)
+ 	auto, errAuto := ApplyForWire(body, "claude-sonnet-5", wireClaude, pluginapi.ThinkingConfig{Mode: "auto", Budget: -1})
